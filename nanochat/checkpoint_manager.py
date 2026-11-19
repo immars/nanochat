@@ -25,6 +25,10 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Old models used the ReLU^2 MLP
+    if "mlp_type" not in model_config_kwargs:
+        model_config_kwargs["mlp_type"] = "relu2"
+        log0(f"Patching missing mlp_type in model config to 'relu2'")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

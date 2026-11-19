@@ -4,7 +4,7 @@ Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
-- relu^2 activation in MLP
+- relu^2 or SwiGLU activation in MLP (config.mlp_type)
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
@@ -37,6 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Feedforward network variant: "relu2" (default, ReLU^2 with 4x expansion) or "swiglu"
+    mlp_type: str = "relu2"
 
 
 def norm(x):
@@ -129,6 +131,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    """ReLU^2 feedforward network with 4x expansion (nanochat default)."""
     def __init__(self, config):
         super().__init__()
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
@@ -140,12 +143,42 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+    def init_weights(self, s):
+        torch.nn.init.uniform_(self.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+        torch.nn.init.zeros_(self.c_proj.weight)
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU feedforward network: c_proj(silu(c_gate(x)) * c_up(x)).
+
+    The hidden size is 8/3 * n_embd so that the three projections have
+    approximately the same parameter count and FLOPs as the 4x ReLU^2 MLP
+    (exactly the same when n_embd is divisible by 3): 3 * n * (8n/3) = 2 * n * 4n.
+    """
+    def __init__(self, config):
+        super().__init__()
+        hidden_dim = (8 * config.n_embd) // 3
+        self.c_gate = Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_up = Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj = Linear(hidden_dim, config.n_embd, bias=False)
+
+    def forward(self, x):
+        return self.c_proj(F.silu(self.c_gate(x)) * self.c_up(x))
+
+    def init_weights(self, s):
+        torch.nn.init.uniform_(self.c_gate.weight, -s * 0.4, s * 0.4)
+        torch.nn.init.uniform_(self.c_up.weight, -s * 0.4, s * 0.4)
+        torch.nn.init.zeros_(self.c_proj.weight)
+
+
+MLP_TYPES = {"relu2": MLP, "swiglu": SwiGLU}
+
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MLP_TYPES[config.mlp_type](config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -161,6 +194,7 @@ class GPT(nn.Module):
         => We actually initialize all data (parameters, buffers, etc.) in init_weights() instead.
         """
         super().__init__()
+        assert config.mlp_type in MLP_TYPES, f"Unknown mlp_type: {config.mlp_type!r}. Choose one of {sorted(MLP_TYPES)}."
         self.config = config
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
@@ -212,8 +246,8 @@ class GPT(nn.Module):
             attn.c_k:        uniform, std=1/sqrt(n_embd)
             attn.c_v:        uniform, std=1/sqrt(n_embd)
             attn.c_proj:     zeros
-            mlp.c_fc:        uniform, std=1/sqrt(n_embd)
-            mlp.c_proj:      zeros
+            mlp (relu2):     c_fc uniform, c_proj zeros
+            mlp (swiglu):    c_gate/c_up uniform, c_proj zeros
         """
 
         # Embedding and unembedding
@@ -228,8 +262,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            block.mlp.init_weights(s)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
