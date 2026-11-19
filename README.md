@@ -107,6 +107,10 @@ See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment
 
 The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
 
+### Feedforward network
+
+The MLP uses ReLU² with 4× expansion by default. To train with a SwiGLU FFN instead, pass `--mlp-type=swiglu` to `scripts/base_train.py`. SwiGLU uses a hidden size of `8/3 × n_embd`, which keeps parameter count and FLOPs on par with the ReLU² MLP. ReLU² remains the default because an earlier d12/d24 sweep found SwiGLU worse (see [dev/LOG.md](dev/LOG.md)); the option is intended for architecture experiments. The checkpoint records `mlp_type`, so evaluation and chat scripts load the right variant automatically.
+
 ## Running on CPU / MPS
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
