@@ -111,6 +111,21 @@ The important thing to note is that nanochat is written and configured around on
 
 The MLP uses ReLU² with 4× expansion by default. To train with a SwiGLU FFN instead, pass `--mlp-type=swiglu` to `scripts/base_train.py`. SwiGLU uses a hidden size of `8/3 × n_embd`, which keeps parameter count and FLOPs on par with the ReLU² MLP. ReLU² remains the default because an earlier d12/d24 sweep found SwiGLU worse (see [dev/LOG.md](dev/LOG.md)); the option is intended for architecture experiments. The checkpoint records `mlp_type`, so evaluation and chat scripts load the right variant automatically.
 
+#### Low-rank FFN experiment
+
+For architecture experiments, every `M × N` FFN weight can optionally be factored into `A` (`M × d`) and `B` (`d × N`), where `d = min(M, N) / r`. Pass `--ffn-low-rank-r 4` (or `2`, `8`, ...) to `scripts/base_train.py`; `0` keeps the normal full-rank FFN and is the default. A factored projection has `d × (M + N)` parameters and two matmuls instead of one, so both parameter count and FFN matmul FLOPs shrink in proportion to `d(M + N) / (M N)`. This applies to both `relu2` and `swiglu` MLPs and only to the FFN (attention is unchanged).
+
+Two variants are available via `--ffn-low-rank-variant`:
+
+- `direct` (default): `W x` becomes `A(B x)`, an exact rank-`d` linear map.
+- `nonlinear`: `W x` becomes `A(σ(B x))`, inserting an activation inside the factorization. `--ffn-low-rank-activation` selects `σ`: `silu` (default), `gelu`, `relu` or `tanh`. This is separate from the FFN's own ReLU²/SwiGLU activation.
+
+`--ffn-low-rank-r` must divide `n_embd` (equivalently `min(M, N)` for every FFN projection). The checkpoint records all three low-rank settings, so evaluation and chat scripts rebuild the same model. Example:
+
+```bash
+python -m scripts.base_train --depth=12 --ffn-low-rank-r=4 --ffn-low-rank-variant=nonlinear
+```
+
 ## Running on CPU / MPS
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.

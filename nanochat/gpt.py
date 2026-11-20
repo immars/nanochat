@@ -4,7 +4,8 @@ Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
-- relu^2 or SwiGLU activation in MLP (config.mlp_type)
+- relu^2 or SwiGLU feedforward network (config.mlp_type)
+- optional low-rank factorization of the FFN weight matrices (config.ffn_low_rank_r)
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
@@ -39,6 +40,13 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     # Feedforward network variant: "relu2" (default, ReLU^2 with 4x expansion) or "swiglu"
     mlp_type: str = "relu2"
+    # Optional low-rank FFN experiment: factor each MxN FFN weight into Mxd and dxN
+    # with d = min(M, N) / r. r = 0 (default) disables the experiment.
+    ffn_low_rank_r: int = 0
+    # "direct": A(Bx); "nonlinear": A(sigma(Bx)). The activation is only used by the
+    # nonlinear variant.
+    ffn_low_rank_variant: str = "direct"
+    ffn_low_rank_activation: str = "silu"
 
 
 def norm(x):
@@ -50,6 +58,93 @@ class Linear(nn.Linear):
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
+
+
+LOW_RANK_VARIANTS = ("direct", "nonlinear")
+LOW_RANK_ACTIVATIONS = {
+    "silu": F.silu,
+    "gelu": F.gelu,
+    "relu": F.relu,
+    "tanh": torch.tanh,
+}
+# Multiplier on A's init std that keeps the output scale of the nonlinear variant
+# comparable to the direct one. For z ~ N(0, sigma^2) with small sigma:
+# E[silu(z)^2] ~ 0.25 sigma^2, E[gelu(z)^2] ~ 0.25 sigma^2, E[relu(z)^2] = 0.5 sigma^2,
+# E[tanh(z)^2] ~ sigma^2, hence the 1/sqrt(E[activation(z)^2]/sigma^2) factors below.
+_LOW_RANK_ACTIVATION_GAIN = {"silu": 2.0, "gelu": 2.0, "relu": 2**0.5, "tanh": 1.0}
+
+
+class LowRankLinear(nn.Module):
+    """A linear layer whose MxN weight is factored into A (Mxd) and B (dxN).
+
+    direct:    y = A(Bx), an ordinary rank-d linear map.
+    nonlinear: y = A(sigma(Bx)), inserting an activation inside the factorization.
+    """
+    def __init__(self, in_features, out_features, rank, *, variant, activation,
+                 init_scale=1.0, zero_output=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.variant = variant
+        self.activation_name = activation
+        self.init_scale = init_scale
+        self.zero_output = zero_output
+        self.a = nn.Parameter(torch.empty(out_features, rank))
+        self.b = nn.Parameter(torch.empty(rank, in_features))
+
+    def forward(self, x):
+        x = F.linear(x, self.b.to(dtype=x.dtype))
+        if self.variant == "nonlinear":
+            x = LOW_RANK_ACTIVATIONS[self.activation_name](x)
+        return F.linear(x, self.a.to(dtype=x.dtype))
+
+    def init_weights(self, s):
+        # B plays the role of the original weight; A restores the output scale
+        # across the rank-d bottleneck (and activation, when nonlinear).
+        torch.nn.init.uniform_(self.b, -s * self.init_scale, s * self.init_scale)
+        if self.zero_output:
+            torch.nn.init.zeros_(self.a)
+        else:
+            gain = _LOW_RANK_ACTIVATION_GAIN[self.activation_name] if self.variant == "nonlinear" else 1.0
+            torch.nn.init.normal_(self.a, mean=0.0, std=gain * self.rank ** -0.5)
+
+
+def _ffn_linear(config, in_features, out_features, *, init_scale, zero_output):
+    """Build a Linear, or its low-rank factored form when the FFN experiment is enabled."""
+    r = config.ffn_low_rank_r
+    if r == 0:
+        return Linear(in_features, out_features, bias=False)
+    assert r > 0, f"ffn_low_rank_r must be >= 0, got {r}"
+    assert config.ffn_low_rank_variant in LOW_RANK_VARIANTS, \
+        f"Unknown ffn_low_rank_variant: {config.ffn_low_rank_variant!r}. Choose one of {LOW_RANK_VARIANTS}."
+    assert config.ffn_low_rank_activation in LOW_RANK_ACTIVATIONS, \
+        f"Unknown ffn_low_rank_activation: {config.ffn_low_rank_activation!r}. Choose one of {sorted(LOW_RANK_ACTIVATIONS)}."
+    # Both FFN variants have min(M, N) == n_embd for every projection, but keep this
+    # generic so it also works if the MLP shapes ever change.
+    min_dim = min(in_features, out_features)
+    assert min_dim % r == 0, \
+        f"ffn_low_rank_r={r} must divide min(in_features, out_features)={min_dim} " \
+        f"for a {out_features}x{in_features} weight matrix"
+    rank = min_dim // r
+    assert rank > 0, f"Low-rank FFN rank must be positive, got d={rank} (r={r}, min_dim={min_dim})"
+    return LowRankLinear(
+        in_features, out_features, rank,
+        variant=config.ffn_low_rank_variant,
+        activation=config.ffn_low_rank_activation,
+        init_scale=init_scale,
+        zero_output=zero_output,
+    )
+
+
+def _init_ffn_linear(layer, s, *, init_scale, zero_output):
+    """Initialize a plain or low-rank FFN linear in the same style as the original MLP."""
+    if isinstance(layer, LowRankLinear):
+        layer.init_weights(s)
+    elif zero_output:
+        torch.nn.init.zeros_(layer.weight)
+    else:
+        torch.nn.init.uniform_(layer.weight, -s * init_scale, s * init_scale)
 
 
 def has_ve(layer_idx, n_layer):
@@ -131,11 +226,15 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """ReLU^2 feedforward network with 4x expansion (nanochat default)."""
+    """ReLU^2 feedforward network with 4x expansion (nanochat default).
+
+    When config.ffn_low_rank_r > 0, c_fc and c_proj are replaced by low-rank
+    factorizations (LowRankLinear).
+    """
     def __init__(self, config):
         super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = _ffn_linear(config, config.n_embd, 4 * config.n_embd, init_scale=0.4, zero_output=False)
+        self.c_proj = _ffn_linear(config, 4 * config.n_embd, config.n_embd, init_scale=1.0, zero_output=True)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -144,8 +243,8 @@ class MLP(nn.Module):
         return x
 
     def init_weights(self, s):
-        torch.nn.init.uniform_(self.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-        torch.nn.init.zeros_(self.c_proj.weight)
+        _init_ffn_linear(self.c_fc, s, init_scale=0.4, zero_output=False)  # 0.4x init scale for c_fc
+        _init_ffn_linear(self.c_proj, s, init_scale=1.0, zero_output=True)
 
 
 class SwiGLU(nn.Module):
@@ -154,21 +253,23 @@ class SwiGLU(nn.Module):
     The hidden size is 8/3 * n_embd so that the three projections have
     approximately the same parameter count and FLOPs as the 4x ReLU^2 MLP
     (exactly the same when n_embd is divisible by 3): 3 * n * (8n/3) = 2 * n * 4n.
+    With config.ffn_low_rank_r > 0, each of the three projections is replaced by
+    a low-rank factorization (LowRankLinear).
     """
     def __init__(self, config):
         super().__init__()
         hidden_dim = (8 * config.n_embd) // 3
-        self.c_gate = Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_up = Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_proj = Linear(hidden_dim, config.n_embd, bias=False)
+        self.c_gate = _ffn_linear(config, config.n_embd, hidden_dim, init_scale=0.4, zero_output=False)
+        self.c_up = _ffn_linear(config, config.n_embd, hidden_dim, init_scale=0.4, zero_output=False)
+        self.c_proj = _ffn_linear(config, hidden_dim, config.n_embd, init_scale=1.0, zero_output=True)
 
     def forward(self, x):
         return self.c_proj(F.silu(self.c_gate(x)) * self.c_up(x))
 
     def init_weights(self, s):
-        torch.nn.init.uniform_(self.c_gate.weight, -s * 0.4, s * 0.4)
-        torch.nn.init.uniform_(self.c_up.weight, -s * 0.4, s * 0.4)
-        torch.nn.init.zeros_(self.c_proj.weight)
+        _init_ffn_linear(self.c_gate, s, init_scale=0.4, zero_output=False)
+        _init_ffn_linear(self.c_up, s, init_scale=0.4, zero_output=False)
+        _init_ffn_linear(self.c_proj, s, init_scale=1.0, zero_output=True)
 
 
 MLP_TYPES = {"relu2": MLP, "swiglu": SwiGLU}
@@ -195,6 +296,11 @@ class GPT(nn.Module):
         """
         super().__init__()
         assert config.mlp_type in MLP_TYPES, f"Unknown mlp_type: {config.mlp_type!r}. Choose one of {sorted(MLP_TYPES)}."
+        assert config.ffn_low_rank_r >= 0, f"ffn_low_rank_r must be >= 0, got {config.ffn_low_rank_r}"
+        assert config.ffn_low_rank_variant in LOW_RANK_VARIANTS, \
+            f"Unknown ffn_low_rank_variant: {config.ffn_low_rank_variant!r}. Choose one of {LOW_RANK_VARIANTS}."
+        assert config.ffn_low_rank_activation in LOW_RANK_ACTIVATIONS, \
+            f"Unknown ffn_low_rank_activation: {config.ffn_low_rank_activation!r}. Choose one of {sorted(LOW_RANK_ACTIVATIONS)}."
         self.config = config
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
@@ -248,6 +354,8 @@ class GPT(nn.Module):
             attn.c_proj:     zeros
             mlp (relu2):     c_fc uniform, c_proj zeros
             mlp (swiglu):    c_gate/c_up uniform, c_proj zeros
+            mlp (low-rank):  B like the original weight, A ~ 1/sqrt(d)
+                             (A is zero for the output projection)
         """
 
         # Embedding and unembedding
@@ -375,10 +483,16 @@ class GPT(nn.Module):
         """
         The number of parameters that participate in matmuls with the token stream,
         i.e. contribute 2 FLOPs/param to the forward pass. Counted structurally: every
-        matmul in this model goes through the Linear class, while non-matmul params
-        (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
+        matmul in this model goes through the Linear or LowRankLinear class, while
+        non-matmul params (embeddings = lookups, per-layer scalars) are nn.Embedding
+        or raw Parameters.
         """
-        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        matmul_params = 0
+        for m in self.modules():
+            if isinstance(m, Linear):
+                matmul_params += m.weight.numel()
+            elif isinstance(m, LowRankLinear):
+                matmul_params += m.a.numel() + m.b.numel()
         return matmul_params
 
     def estimate_decode_flops(self, context_len):

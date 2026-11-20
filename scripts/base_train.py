@@ -25,7 +25,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, Linear, LOW_RANK_ACTIVATIONS, LOW_RANK_VARIANTS
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -53,6 +53,9 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--mlp-type", type=str, default="relu2", choices=["relu2", "swiglu"], help="feedforward network: relu2 (ReLU^2, 4x expansion) or swiglu (SwiGLU, 8/3x expansion)")
+parser.add_argument("--ffn-low-rank-r", type=int, default=0, help="low-rank FFN experiment: factor each FFN weight into rank min(M,N)/r; 0 disables (default)")
+parser.add_argument("--ffn-low-rank-variant", type=str, default="direct", choices=list(LOW_RANK_VARIANTS), help="low-rank FFN variant: direct A(Bx) or nonlinear A(sigma(Bx))")
+parser.add_argument("--ffn-low-rank-activation", type=str, default="silu", choices=sorted(LOW_RANK_ACTIVATIONS), help="activation sigma for the nonlinear low-rank FFN variant")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -139,6 +142,9 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         mlp_type=args.mlp_type,
+        ffn_low_rank_r=args.ffn_low_rank_r,
+        ffn_low_rank_variant=args.ffn_low_rank_variant,
+        ffn_low_rank_activation=args.ffn_low_rank_activation,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -192,6 +198,8 @@ if args.fp8:
         num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
         num_skipped = num_linear - num_fp8
         print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+        if args.ffn_low_rank_r > 0:
+            print0("Note: --fp8 only converts full-rank nn.Linear layers; low-rank FFN factors stay in the compute dtype")
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
