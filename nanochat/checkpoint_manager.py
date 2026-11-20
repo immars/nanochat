@@ -29,6 +29,16 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "mlp_type" not in model_config_kwargs:
         model_config_kwargs["mlp_type"] = "relu2"
         log0(f"Patching missing mlp_type in model config to 'relu2'")
+    # Old models used full-rank FFN weights
+    if "ffn_low_rank_r" not in model_config_kwargs:
+        model_config_kwargs["ffn_low_rank_r"] = 0
+        log0(f"Patching missing ffn_low_rank_r in model config to 0")
+    if "ffn_low_rank_variant" not in model_config_kwargs:
+        model_config_kwargs["ffn_low_rank_variant"] = "direct"
+        log0(f"Patching missing ffn_low_rank_variant in model config to 'direct'")
+    if "ffn_low_rank_activation" not in model_config_kwargs:
+        model_config_kwargs["ffn_low_rank_activation"] = "silu"
+        log0(f"Patching missing ffn_low_rank_activation in model config to 'silu'")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

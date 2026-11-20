@@ -409,6 +409,9 @@ while True:
                     "n_embd": model.config.n_embd,
                     "window_pattern": model.config.window_pattern,
                     "mlp_type": model.config.mlp_type,
+                    "ffn_low_rank_r": model.config.ffn_low_rank_r,
+                    "ffn_low_rank_variant": model.config.ffn_low_rank_variant,
+                    "ffn_low_rank_activation": model.config.ffn_low_rank_activation,
                 },
                 "user_config": user_config, # inputs to the training script
             },

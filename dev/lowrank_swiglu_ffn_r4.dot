@@ -1,0 +1,48 @@
+digraph FFN {
+  graph [
+    rankdir=TB, bgcolor="white", pad="0.2", nodesep="0.30", ranksep="0.28",
+    fontname="Helvetica", fontsize=10,
+    label=<<b>nanochat d12 · SwiGLU FFN with nonlinear low-rank factors (r = 4)</b><br/><font point-size="9">n_embd 768 · hidden 2048 · d = 192 · one of 12 identical FFN subgraphs</font><br/><font point-size="9">W → A · σ(B · x) · params/FFN 1.62M (vs 4.72M) · FLOPs/token 3.24M (vs 9.44M)</font>>,
+    labelloc=t, labeljust=c
+  ];
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10.5,
+        color="#94a3b8", fillcolor="#f8fafc", penwidth=1.2, margin="0.12,0.06"];
+  edge [fontname="Helvetica", fontsize=9, color="#475569", arrowsize=0.7, penwidth=1.1];
+
+  x [label=<<b>x</b><br/>768>, shape=oval, fillcolor="#e2e8f0", color="#64748b"];
+
+  subgraph cluster_gate {
+    label=<<b>c_gate path</b>>; style="rounded,dashed"; color="#f59e0b"; fontsize=11;
+    bg [label=<<b>B_gate</b><br/>192 × 768>, fillcolor="#fef3c7", color="#d97706"];
+    sg [label=<<b>SiLU</b><br/>σ>, fillcolor="#dcfce7", color="#16a34a"];
+    ag [label=<<b>A_gate</b><br/>2048 × 192>, fillcolor="#fef3c7", color="#d97706"];
+    g  [label=<<b>g</b><br/>2048>, shape=oval, fillcolor="#e0f2fe", color="#0284c7"];
+    sg_outer [label=<<b>SiLU</b><br/>(SwiGLU gate)>, fillcolor="#dcfce7", color="#16a34a"];
+    bg -> sg -> ag -> g -> sg_outer;
+  }
+
+  subgraph cluster_up {
+    label=<<b>c_up path</b>>; style="rounded,dashed"; color="#f59e0b"; fontsize=11;
+    bu [label=<<b>B_up</b><br/>192 × 768>, fillcolor="#fef3c7", color="#d97706"];
+    su [label=<<b>SiLU</b><br/>σ>, fillcolor="#dcfce7", color="#16a34a"];
+    au [label=<<b>A_up</b><br/>2048 × 192>, fillcolor="#fef3c7", color="#d97706"];
+    u  [label=<<b>u</b><br/>2048>, shape=oval, fillcolor="#e0f2fe", color="#0284c7"];
+    bu -> su -> au -> u;
+  }
+
+  mul [label=<<b>×</b>>, shape=circle, width=0.5, fixedsize=true, fillcolor="#f1f5f9", color="#64748b"];
+  h [label=<<b>h</b><br/>2048>, shape=oval, fillcolor="#e0f2fe", color="#0284c7"];
+
+  subgraph cluster_proj {
+    label=<<b>c_proj path</b>>; style="rounded,dashed"; color="#f59e0b"; fontsize=11;
+    bp [label=<<b>B_proj</b><br/>192 × 2048>, fillcolor="#fef3c7", color="#d97706"];
+    sp [label=<<b>SiLU</b><br/>σ>, fillcolor="#dcfce7", color="#16a34a"];
+    ap [label=<<b>A_proj</b><br/>768 × 192>, fillcolor="#fef3c7", color="#d97706"];
+    y  [label=<<b>y</b><br/>768>, shape=oval, fillcolor="#dbeafe", color="#2563eb"];
+    bp -> sp -> ap -> y;
+  }
+
+  x -> bg; x -> bu;
+  sg_outer -> mul; u -> mul;
+  mul -> h -> bp;
+}
